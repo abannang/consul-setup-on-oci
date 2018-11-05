@@ -1,0 +1,583 @@
+#!/usr/bin/env bash
+#
+# Description:
+#
+# This script configures and starts the Consul (https://www.consul.io/) agents
+# to form a cluster on Oracle Cloud Infrastructure Compute Instances 
+# (https://cloud.oracle.com/en_US/infrastructure/compute). It should be 
+# invoked during the bootstrap process of the OCI Instance. It requires the 
+# Consul and dependencies to be already installed using the install-consul 
+# module to run successfully on the OCI Instances.
+#
+# Note:
+# This script has been tested on the following Operating Systems:
+#   * Oracle Linux 7.4
+#
+
+# Set bash options
+set -e
+
+# Cleanup before exit
+trap 'cleanup "$@"' INT TERM EXIT
+
+# Variables specific to this file
+readonly _VERSION="0.1.0"
+readonly _DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly _FILE_NAME="$(basename "${BASH_SOURCE[0]}")"
+readonly _BASE="$(basename ${_FILE_NAME} .sh)"
+readonly _FILE="${_DIR}/${_FILE_NAME}"
+readonly _TMP="$(mktemp -d -t ${_BASE}_XXXX)"
+
+# Consul specific variables
+readonly CONSUL_CONFIG_FILE_NAME="default.json"
+readonly SUPERVISOR_CONFIG_FILE="/etc/supervisor/conf.d/run-consul.conf"
+
+# Variables specific to Oracle Cloud Infrastructure CLI
+readonly OCI_CONFIG_DIR="$(eval echo ~${USER})/.oci"
+readonly OCI_CONFIG_FILE="${OCI_CONFIG_DIR}/config"
+readonly OCI_DEFAULTS_FILE="${OCI_CONFIG_DIR}/cli-defaults"
+readonly OCI_PRIVATE_KEY_FILE="${OCI_CONFIG_DIR}/oci_api_key.pem"
+readonly OCI_INSTANCE_METADATA_URL="http://169.254.169.254/opc/v1/instance/"
+
+# Ports for Consul
+# SERF_RPC_PORT=8300
+# SERF_LAN_PORT=8301
+# SERF_WAN_PORT=8302
+# CLI_RPC_PORT=8400
+# HTTP_API_PORT=8500
+# DNS_PORT=8600
+readonly PORTS=("8300" "8301" "8302" "8400" "8500" "8600")
+
+# Print Usage
+function print_usage {
+  echo -e "Usage: ${_FILE_NAME} command [OPTIONS]"
+  echo
+  echo -e "  Runs Consul on Oracle Cloud Infrastructure instance."
+  echo
+  echo -e "Options:"
+  echo -e "  --server\t\t\tset server mode"
+  echo -e "  --client\t\t\tset client mode"
+  echo
+  echo -e "    Either --server or --client must be set."
+  echo
+  echo -e "  --cluster-name [name]\t\tcluster name to enable retry_join. Required."
+  echo -e "  --server-tag [tag]\t\tserver tag to enable bootstrap_expect. Required in --server mode."
+  echo -e "  --config-dir [path]\t\tset Consul config dir"
+  echo -e "\t\t\t\t(default is the absolute path of '../config' relative to this script)"
+  echo -e "  --data-dir [path]\t\tset Consul data dir"
+  echo -e "\t\t\t\t(default is the absolute path of '../data' relative to this script)"
+  echo -e "  --log-dir [path]\t\tset Consul log dir"
+  echo -e "\t\t\t\t(default is the absolute path of '../log' relative to this script)"
+  echo -e "  --bin-dir [path]\t\tset Consul bin dir"
+  echo -e "\t\t\t\t(default is the absolute path of the parent folder of this script)"
+  echo -e "  --user [user]\t\t\tset user for running Consul"
+  echo -e "\t\t\t\t(default is the owner of --config-dir)"
+  echo -e "  --oci-user-ocid [OCID]\tset OCID of the user to access the Oracle Cloud Infrastructure"
+  echo -e "\t\t\t\tRequired if --skip-oci-config is not set."
+  echo -e "  --oci-fingerprint [fingerprint]"
+  echo -e "\t\t\t\tset fingerprint of the user provided by --oci-user-ocid to access the Oracle Cloud Infrastructure API's"
+  echo -e "\t\t\t\tRequired if --skip-oci-config is not set."
+  echo -e "  --oci-private-key [value]\tset RSA private key value that matches the fingerprint provided by --oci-fingerprint"
+  echo -e "\t\t\t\tRequired if --skip-oci-config is not set."
+  echo -e "  --oci-tenancy-ocid [OCID]\tset OCID of the Oracle Cloud Infrastructure Tenancy"
+  echo -e "\t\t\t\tRequired if --skip-oci-config is not set."
+  echo -e "  --oci-region [region]\t\tset the Oracle Cloud Infrastructure Region"
+  echo -e "\t\t\t\tRequired if --skip-oci-config is not set."
+  echo -e "  --ports [port,...]\t\tset ports to open for Consul communication"
+  echo -e "\t\t\t\t(default ports to open are '${PORTS[*]}')"
+  echo -e "  --skip-oci-config\t\tskip Oracle Cloud Infrastructure CLI configuration"
+  echo -e "  --skip-consul-config\t\tskip Consul configuration file creation"
+  echo -e "  -v, --version\t\t\tshow ${_FILE_NAME} version and exit"
+  echo -e "  -h, --help\t\t\tdisplay this help and exit"
+}
+
+# Log Message
+function log {
+  local readonly level="$1"
+  local readonly message="$2"
+  local readonly timestamp=$(date +"%Y-%m-%d %H:%M:%S")
+  echo "${timestamp} [${level}] ${message}" \
+        | sudo tee -a /var/log/${_BASE}.log \
+        | sed --expression="s/${timestamp} //g" \
+        | logger -t ${_BASE} -s \
+        |& sed --expression="s/${_BASE}: //g" 1>&2
+}
+
+# Log INFO Message
+function log_info {
+  local readonly message="$1"
+  log "INFO" "$message"
+}
+
+# Log WARNING Message
+function log_warn {
+  local readonly message="$1"
+  log "WARNING" "$message"
+}
+
+# Log ERROR Message
+function log_error {
+  local readonly message="$1"
+  log "ERROR" "$message"
+}
+
+# Start Consul
+function start_consul {
+  log_info "Reloading Supervisor config and starting Consul..."
+  supervisorctl reread
+  supervisorctl update
+}
+
+# Create Supervisor config
+function generate_supervisor_config {
+  local readonly supervisor_config_file="$1"
+  local readonly consul_config_dir="$2"
+  local readonly consul_data_dir="$3"
+  local readonly consul_log_dir="$4"
+  local readonly consul_bin_dir="$5"
+  local readonly consul_user="$6"
+
+  log_info "Creating Supervisor config file ${supervisor_config_file} to run Consul"
+  cat > "${supervisor_config_file}" <<EOF
+[program:consul]
+command=${consul_bin_dir}/consul agent -config-dir ${consul_config_dir} -data-dir ${consul_data_dir}
+stdout_logfile=${consul_log_dir}/consul-stdout.log
+stderr_logfile=${consul_log_dir}/consul-error.log
+numprocs=1
+autostart=true
+autorestart=true
+stopsignal=INT
+user=${consul_user}
+EOF
+}
+
+# Configure firewall
+function configure_firewall {
+  local ports=("$@")
+
+  if [[ ! $(command -v firewall-cmd) ]]; then
+    log_warn "Unable to find firewall-cmd. Skipping firewall configuration..."
+  else
+    local enabled=( $(sudo firewall-offline-cmd --zone=public --list-ports) )
+    enabled=( ${enabled[@]/\/*/} )
+    if [[ "${#enabled[@]}" -ne 0 ]]; then
+      for port in "${enabled[@]}"; do
+        ports=( ${ports[@]#$port} )
+      done
+    fi
+
+    if [[ "${#ports[@]}" -eq 0 ]]; then
+      log_info "All ports already enabled."
+    else
+      log_info "Opening firewall for ports: ${ports[*]}"
+      for port in "${ports[@]}"; do
+        sudo firewall-offline-cmd --zone=public --add-port="${port}"/tcp
+      done
+    fi
+    log_info "Restarting firewalld service..."
+    sudo systemctl restart firewalld
+  fi
+}
+
+# Lookup in instance metadata
+function lookup_path_in_instance_metadata {
+  local readonly path="$1"
+  curl --silent --show-error --location "${OCI_INSTANCE_METADATA_URL}/${path}"
+}
+
+# Get compartment OCID
+function get_compartment_id {
+  lookup_path_in_instance_metadata "compartmentId"
+}
+
+# Get instance OCID
+function get_instance_id {
+  lookup_path_in_instance_metadata "id"
+}
+
+# Get instance name
+function get_instance_name {
+  lookup_path_in_instance_metadata "displayName"
+}
+
+# Get region
+function get_region {
+  lookup_path_in_instance_metadata "region"
+}
+
+# Get instance private IP address
+function get_instance_private_ip {
+  local readonly instance_id="$1"
+  oci compute instance list-vnics --instance-id "${instance_id}" | jq -r '.data[]|.["private-ip"]'
+}
+
+# Get instance FQDN
+function get_instance_fqdn {
+  local readonly instance_id="$1"
+  local instance_vnic_json="$(oci compute instance list-vnics --instance-id "${instance_id}")"
+  local hostname_label="$(echo $instance_vnic_json | jq -r '.data[]|.["hostname-label"]')"
+  local subnet_id="$(echo $instance_vnic_json | jq -r '.data[]|.["subnet-id"]')"
+  local subnet_domain="$(oci network subnet get --subnet-id "${subnet_id}" | jq -r '.data|.["subnet-domain-name"]')"
+  echo "${hostname_label}.${subnet_domain}"
+}
+
+# Get local instance private IP address
+function get_local_private_ip {
+  local readonly instance_id="$1"
+  if [[ -f "${OCI_CONFIG_FILE}" ]]; then
+    get_instance_private_ip "$(get_instance_id)"
+  else
+    log_warn "Oracle Cloud Infrastructure CLI config file does not exist. Running command 'hostname' to get private IP address."
+    hostname -I
+  fi
+}
+
+# Create Consul config
+function generate_consul_config {
+  local readonly server="$1"
+  local readonly config_dir="$2"
+  local readonly user="$3"
+  local readonly cluster_name="$4"
+  local readonly server_tag="$5"
+  local readonly config_path="${config_dir}/${CONSUL_CONFIG_FILE_NAME}"
+
+  local region=$(get_region)
+  log_info "Region: $region"
+
+  local instance_name=$(get_instance_name)
+  log_info "Instance name: $instance_name"
+
+  local instance_id=$(get_instance_id)
+  log_info "Instance ID: $instance_id"
+
+  local node_name="$(get_instance_fqdn "$instance_id")"
+  log_info "Instance FQDN: $node_name"
+
+  if [[ "$node_name" == "" || "$node_name" == "." ]]; then
+    node_name="$instance_name"
+  fi
+
+  local instance_ip_address=$(get_local_private_ip)
+  log_info "Instance IP address: $instance_ip_address"
+
+  local bootstrap_expect=""
+  local retry_join_json=""
+
+  if [[ ! -f "${OCI_CONFIG_FILE}" ]]; then
+    log_warn "Oracle Cloud Infrastructure CLI config file does not exist. Unable to set retry_join."
+  else
+    log_info "Getting list of all instances..."
+    local instances_json="$(oci compute instance list | jq -r '[.data[]|select(.["lifecycle-state"]==("PROVISIONING","RUNNING","STARTING","STOPPING","STOPPED","CREATING_IMAGE"))]')"
+    instances_json="$(echo $instances_json | jq -r --arg CLUSTER_NAME "${cluster_name}" '[.[]|select(.["display-name"] | contains($CLUSTER_NAME))|with_entries(select(.key==("id","display-name")))]')"
+    local peer_ids=( $(echo $instances_json | jq -r --arg ID "$instance_id" '.[]|select(.id!=$ID)|.id') )
+    if [[ "${#peer_ids[@]}" -eq 0 ]]; then
+      log_warn "No other instances available with tag '$cluster_name'. Unable to set retry_join."
+    else
+      local peer_ips=()
+    for id in ${peer_ids[@]}; do
+        local ip_address="$(get_instance_private_ip "$id")"
+        if [[ "$ip_address" != "" ]]; then
+          log_info "IP address will be added to retry_join: $ip_address"
+          peer_ips=( "${peer_ips[@]}" "$ip_address" )
+        else
+          log_warn "Unable to get IP address of instance: $id"
+        fi
+      done
+      
+      if [[ "${#peer_ips[@]}" -eq 0 ]]; then
+        log_warn "No other members available. Unable to set retry_join."
+      else
+        log_info "Enabling retry join: ${peer_ips[*]}"
+        local retry_join="$(printf '%s\n' "${peer_ips[@]}" | jq -R . | jq -s .)"
+        retry_join_json=$(cat <<EOF
+"retry_join": ${retry_join},
+EOF
+)
+      fi
+    fi
+    
+    if [[ "$server" == "true" ]]; then
+      local nserver=$(echo $instances_json | jq --arg SERVER_TAG "${server_tag}" -r '[.[]|select(.["display-name"] | contains($SERVER_TAG))]|length')
+      if [[ "$nserver" -gt 0 ]]; then
+        log_info "[SERVER MODE]: Enabling bootstrap expect for $nserver server(s)."
+        bootstrap_expect="\"bootstrap_expect\": ${nserver},"
+      else
+      log_warn "No other servers available with tag '${server_tag}'. Unable to set bootstrap_expect."
+      fi
+    fi
+  fi
+
+  log_info "Creating Consul config file $config_path"
+  cat > "${config_path}" <<EOF
+{
+  "advertise_addr": "${instance_ip_address}",
+  "bind_addr": "${instance_ip_address}",
+  ${bootstrap_expect}
+  "client_addr": "0.0.0.0",
+  "datacenter": "${region}",
+  "node_name": "${node_name}",
+  ${retry_join_json}
+  "server": ${server},
+  "ui": true
+}
+EOF
+  chown "${user}:${user}" "${config_path}"
+}
+
+# Create Oracle Cloud Infrastructure CLI config
+function generate_oci_config {
+  local readonly tenancy_ocid="$1"
+  local readonly region="$2"
+  local readonly user_ocid="$3"
+  local readonly fingerprint="$4"
+  local readonly oci_private_key="$5"
+
+  log_info "Creating Oracle Cloud Infrastructure CLI config file in ${OCI_CONFIG_FILE}"
+  mkdir -p "${OCI_CONFIG_DIR}"
+  
+log_info "Creating private key file"
+  cat > "${OCI_PRIVATE_KEY_FILE}" <<EOF
+${oci_private_key}
+EOF
+  
+  cat > "${OCI_CONFIG_FILE}" <<EOF
+[DEFAULT]
+user=${user_ocid}
+fingerprint=${fingerprint}
+key_file=${OCI_PRIVATE_KEY_FILE}
+tenancy=${tenancy_ocid}
+region=${region}
+EOF
+
+  local readonly compartment_id=$(get_compartment_id)
+  log_info "Creating Oracle Cloud Infrastructure CLI defaults file to in ${OCI_DEFAULTS_FILE}"
+  cat > "${OCI_DEFAULTS_FILE}" <<EOF
+[DEFAULT]
+compartment-id = ${compartment_id}
+EOF
+}
+
+# Validate dependencies
+function assert_is_installed {
+  local readonly name="$1"
+
+  if [[ ! $(command -v ${name}) ]]; then
+    log_error "The binary '$name' is required by this script but is not installed or in the system's PATH."
+    exit 1
+  fi
+}
+
+# Get path owner
+function get_owner_of_path {
+  local readonly path="$1"
+  ls -ld "$path" | awk '{print $3}'
+}
+
+# Validate argument
+function assert_not_empty {
+  local readonly arg="$1"
+  local readonly value="$2"
+
+  if [[ -z "$value" ]]; then
+    log_error "Value for '$arg' cannot be empty."
+    >&2 print_usage
+    exit 1
+  fi
+}
+
+# Run
+function run {
+  local server="false"
+  local client="false"
+  local cluster_name=""
+  local server_tag=""
+  local config_dir=""
+  local data_dir=""
+  local log_dir=""
+  local bin_dir=""
+  local user=""
+  local oci_tenancy_ocid=""
+  local oci_region=""
+  local oci_user_ocid=""
+  local oci_fingerprint=""
+  local oci_private_key=""
+  local skip_consul_config="false"
+  local skip_oci_config="false"
+  local ports=()
+  local all_args=()
+
+  while [[ $# > 0 ]]; do
+    local arg="$1"
+
+    case "$arg" in
+      --server)
+        server="true"
+        ;;
+      --client)
+        client="true"
+        ;;
+      --cluster-name)
+        assert_not_empty "$arg" "$2"
+        cluster_name="$2"
+        shift
+        ;;
+      --server-tag)
+        assert_not_empty "$arg" "$2"
+        server_tag="$2"
+        shift
+        ;;
+      --config-dir)
+        assert_not_empty "$arg" "$2"
+        config_dir="$2"
+        shift
+        ;;
+      --data-dir)
+        assert_not_empty "$arg" "$2"
+        data_dir="$2"
+        shift
+        ;;
+      --log-dir)
+        assert_not_empty "$arg" "$2"
+        log_dir="$2"
+        shift
+        ;;
+      --bin-dir)
+        assert_not_empty "$arg" "$2"
+        bin_dir="$2"
+        shift
+        ;;
+      --user)
+        assert_not_empty "$arg" "$2"
+        user="$2"
+        shift
+        ;;
+      --oci-tenancy-ocid)
+        assert_not_empty "$arg" "$2"
+        oci_tenancy_ocid="$2"
+        shift
+        ;;
+      --oci-region)
+        assert_not_empty "$arg" "$2"
+        oci_region="$2"
+        shift
+        ;;
+      --oci-user-ocid)
+        assert_not_empty "$arg" "$2"
+        oci_user_ocid="$2"
+        shift
+        ;;
+      --oci-fingerprint)
+        assert_not_empty "$arg" "$2"
+        oci_fingerprint="$2"
+        shift
+        ;;
+      --oci-private-key)
+        assert_not_empty "$arg" "$2"
+        oci_private_key="$2"
+        shift
+        ;;
+      --skip-oci-config)
+        skip_oci_config="true"
+        ;;
+      --skip-consul-config)
+        skip_consul_config="true"
+        ;;
+      --ports)
+        assert_not_empty "$arg" "$2"
+        ports=( $(echo "$2" | sed 's/,/ /g') )
+        shift
+        ;;
+      -v|--version)
+        echo "${_VERSION}"
+        exit
+        ;;
+      -h|--help)
+        print_usage
+        exit
+        ;;
+      *)
+        log_error "Unrecognized argument: '$arg'"
+        >&2 print_usage
+        exit 1
+        ;;
+    esac
+
+    shift
+  done
+
+  assert_is_installed "supervisorctl"
+
+  if [[ ("$server" == "true" && "$client" == "true") || ("$server" == "false" && "$client" == "false") ]]; then
+    log_error "Exactly one of --server or --client must be set."
+    >&2 print_usage
+    exit 1
+  fi
+
+  assert_not_empty "--cluster-name" "$cluster_name"
+  if [[ "$server" == "true" && -z "$server_tag" ]]; then
+    log_error "--server-tag must be set if --server is set."
+    >&2 print_usage
+    exit 1
+  fi
+
+  if [[ -z "$config_dir" ]]; then
+    config_dir=$(cd "${_DIR}/../config" && pwd)
+  fi
+
+  if [[ -z "$data_dir" ]]; then
+    data_dir=$(cd "${_DIR}/../data" && pwd)
+  fi
+
+  if [[ -z "$log_dir" ]]; then
+    log_dir=$(cd "${_DIR}/../log" && pwd)
+  fi
+
+  if [[ -z "$bin_dir" ]]; then
+    bin_dir=$(cd "${_DIR}/../bin" && pwd)
+  fi
+
+  if [[ -z "$user" ]]; then
+    user=$(get_owner_of_path "${config_dir}")
+  fi
+  
+  if [[ "${#ports[@]}" -eq 0 ]]; then
+    ports=( "${PORTS[@]}" )
+  fi
+
+  if [[ "$skip_consul_config" == "true" ]]; then
+    log_info "The --skip-consul-config flag is set, so will not generate a default Consul config file."
+  else
+    assert_is_installed "curl"
+    assert_is_installed "jq"
+    
+    if [[ "$skip_oci_config" == "true" ]]; then
+      log_info "The --skip-oci-config flag is set, so will not generate a Oracle Cloud Infrastructure CLI config file."
+    else
+      assert_is_installed "oci"
+
+      assert_not_empty "--oci-tenancy-ocid" "$oci_tenancy_ocid"
+      assert_not_empty "--oci-region" "$oci_region"
+      assert_not_empty "--oci-user-ocid" "$oci_user_ocid"
+      assert_not_empty "--oci-fingerprint" "$oci_fingerprint"
+      assert_not_empty "--oci-private-key" "$oci_private_key"
+
+      generate_oci_config "$oci_tenancy_ocid" "$oci_region" "$oci_user_ocid" "$oci_fingerprint" "$oci_private_key"
+    fi
+
+    generate_consul_config "$server" "$config_dir" "$user" "$cluster_name" "$server_tag"
+  fi
+
+  configure_firewall "${ports[@]}"
+  generate_supervisor_config "${SUPERVISOR_CONFIG_FILE}" "$config_dir" "$data_dir" "$log_dir" "$bin_dir" "$user"
+  start_consul
+  log_info "Run Consul Complete."
+}
+
+# Silent cleanup
+function cleanup {
+  sudo rm -rf "${OCI_CONFIG_DIR}"
+  sudo rm -rf "${_TMP}"
+}
+
+# Start run
+run "$@"

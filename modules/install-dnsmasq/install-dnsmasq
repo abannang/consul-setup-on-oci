@@ -1,0 +1,186 @@
+#!/usr/bin/env bash
+#
+# Description:
+#
+# This script installs Dnsmasq (http://www.thekelleys.org.uk/dnsmasq/doc.html) 
+# on Oracle Cloud Infrastructure Compute Instances 
+# (https://cloud.oracle.com/en_US/infrastructure/compute) and configures it to
+# forward requests for a specific domain to Consul (https://www.consul.io/).
+# 
+# Note:
+# This script has been tested on the following Operating Systems:
+#   * Oracle Linux 7.4
+#
+
+# Set bash options
+set -e
+
+# Cleanup before exit
+trap 'cleanup "$@"' INT TERM EXIT
+
+# Variables specific to this file
+readonly _VERSION="0.1.0"
+readonly _DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly _FILE_NAME="$(basename "${BASH_SOURCE[0]}")"
+readonly _BASE="$(basename ${_FILE_NAME} .sh)"
+readonly _FILE="${_DIR}/${_FILE_NAME}"
+readonly _TMP="$(mktemp -d -t ${_BASE}_XXXX)"
+
+# Default variables for Dnsmasq configuration for Consul
+readonly DEFAULT_CONSUL_DOMAIN="consul"
+readonly DEFAULT_CONSUL_IP="127.0.0.1"
+readonly DEFAULT_CONSUL_DNS_PORT=8600
+
+# Variables for Dnsmasq
+readonly DNS_MASQ_CONFIG_DIR="/etc/dnsmasq.d"
+readonly CONSUL_DNS_MASQ_CONFIG_FILE="${DNS_MASQ_CONFIG_DIR}/10-consul"
+
+# Print Usage
+function print_usage {
+  echo -e "Usage: ${_FILE_NAME} [OPTIONS]"
+  echo
+  echo -e "  Installs Dnsmasq and configures it for Consul on Oracle Cloud Infrastructure instance."
+  echo
+  echo -e "Options:"
+  echo -e "  --consul-domain [domain]\tset domain for Consul (default is ${DEFAULT_CONSUL_DOMAIN})"
+  echo -e "  --consul-ip [IP address]\tset IP address for Consul (default is ${DEFAULT_CONSUL_IP})"
+  echo -e "  --consul-dns-port [port]\tset port for Consul DNS (default it ${DEFAULT_CONSUL_DNS_PORT})"
+  echo -e "  -v, --version\t\t\tshow ${_FILE_NAME} version and exit"
+  echo -e "  -h, --help\t\t\tdisplay this help and exit"
+}
+
+# Log Message
+function log {
+  local readonly level="$1"
+  local readonly message="$2"
+  local readonly timestamp=$(date +"%Y-%m-%d %H:%M:%S")
+  echo "${timestamp} [${level}] ${message}" \
+        | sudo tee -a /var/log/${_BASE}.log \
+        | sed --expression="s/${timestamp} //g" \
+        | logger -t ${_BASE} -s \
+        |& sed --expression="s/${_BASE}: //g" 1>&2
+}
+
+# Log INFO Message
+function log_info {
+  local readonly message="$1"
+  log "INFO" "$message"
+}
+
+# Log WARNING Message
+function log_warn {
+  local readonly message="$1"
+  log "WARNING" "$message"
+}
+
+# Log ERROR Message
+function log_error {
+  local readonly message="$1"
+  log "ERROR" "$message"
+}
+
+# Install Dnsmasq
+function install_dnsmasq {
+  local readonly consul_ip="$1"
+
+  log_info "Installing dependencies..."
+  if [[ -n "$(command -v apt-get)" ]]; then
+    sudo apt-get update -y
+    sudo apt-get install -y dnsmasq
+  elif [[ -n "$(command -v yum)" ]]; then
+    sudo yum update -y
+    sudo yum install -y dnsmasq
+    echo "prepend domain-name-servers ${consul_ip};" | sudo tee -a "/etc/dhcp/dhclient.conf" > /dev/null
+    echo "conf-dir=${DNS_MASQ_CONFIG_DIR}" | sudo tee -a "/etc/dnsmasq.conf" > /dev/null
+    sudo chkconfig dnsmasq on
+  else
+    log_error "Unable to find apt-get or yum. Cannot install Dnsmasq on this Operating System."
+    exit 1
+  fi
+}
+
+# Create Dnsmasq configuration for Consul
+function write_consul_config {
+  local readonly consul_domain="$1"
+  local readonly consul_ip="$2"
+  local readonly consul_port="$3"
+
+  log_info "Configuring Dnsmasq to forward lookups of the '$consul_domain' domain to $consul_ip:$consul_port in ${CONSUL_DNS_MASQ_CONFIG_FILE}"
+  mkdir -p "${DNS_MASQ_CONFIG_DIR}"
+
+  sudo tee "${CONSUL_DNS_MASQ_CONFIG_FILE}" <<EOF
+# Enable forward lookup of the '${consul_domain}' domain:
+server=/${consul_domain}/${consul_ip}#${consul_port}
+
+listen-address=${consul_ip}
+bind-interfaces
+EOF
+}
+
+# Validate argument
+function assert_not_empty {
+  local readonly arg="$1"
+  local readonly value="$2"
+
+  if [[ -z "$value" ]]; then
+    log_error "Value for '$arg' cannot be empty."
+    >&2 print_usage
+    exit 1
+  fi
+}
+
+function install {
+  local consul_domain="$DEFAULT_CONSUL_DOMAIN"
+  local consul_ip="$DEFAULT_CONSUL_IP"
+  local consul_dns_port="$DEFAULT_CONSUL_DNS_PORT"
+
+  while [[ $# > 0 ]]; do
+    local arg="$1"
+
+    case "$arg" in
+      --consul-domain)
+        assert_not_empty "$arg" "$2"
+        consul_domain="$2"
+        shift
+        ;;
+      --consul-ip)
+        assert_not_empty "$arg" "$2"
+        consul_ip="$2"
+        shift
+        ;;
+      --consul-dns-port)
+        assert_not_empty "$arg" "$2"
+        consul_dns_port="$2"
+        shift
+        ;;
+      -v|--version)
+        echo "${_VERSION}"
+        exit
+        ;;
+      -h|--help)
+        print_usage
+        exit
+        ;;
+      *)
+        log_error "Unrecognized argument: '$arg'"
+        >&2 print_usage
+        exit 1
+        ;;
+    esac
+
+    shift
+  done
+
+  log_info "Starting Dnsmasq installation..."
+  install_dnsmasq "$consul_ip"
+  write_consul_config "$consul_domain" "$consul_ip" "$consul_dns_port"
+  log_info "Dnsmasq installation Complete."
+}
+
+# Silent cleanup
+function cleanup {
+  sudo rm -rf "${_TMP}"
+}
+
+# Start install
+install "$@"

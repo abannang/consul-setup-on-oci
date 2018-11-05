@@ -1,0 +1,49 @@
+{
+  "min_packer_version": "1.1.0",
+  "variables": {
+    "consul_version": "1.0.0",
+    "shape": "VM.Standard1.2",
+    "base_image_ocid": "ocid1.image.oc1.phx.aaaaaaaa3g2xpzlbrrdknqcjtzv2tvxcofjc55vdcmpxdlbohmtt7encpana",
+    "compartment_ocid": "",
+    "subnet_ocid": "",
+    "availability_domain": ""
+  },
+  "builders": [
+    {
+      "type": "oracle-oci",
+      "compartment_ocid": "{{user `compartment_ocid`}}",
+      "image_name": "Consul-{{user `consul_version`}} Oracle Linux-7.4 {{timestamp}}",
+      "base_image_ocid": "{{user `base_image_ocid`}}",
+      "availability_domain": "{{user `availability_domain`}}",
+      "subnet_ocid": "{{user `subnet_ocid`}}",
+      "shape": "{{user `shape`}}",
+      "communicator": "ssh",
+      "ssh_username": "opc",
+      "ssh_pty": "true"
+    }
+  ],
+  "provisioners": [
+    {
+      "type": "shell",
+      "inline": [
+        "mkdir -p /tmp/terraform-oci-consul"
+      ]
+    },
+    {
+      "type": "file",
+      "source": "{{template_dir}}/../../",
+      "destination": "/tmp/terraform-oci-consul/"
+    },
+    {
+      "type": "shell",
+      "execute_command": " chmod +x {{ .Path }}; {{ .Vars }} sudo -E bash '{{ .Path }}'",
+      "inline": [
+        "chmod -R a+x /tmp/terraform-oci-consul/",
+        "/tmp/terraform-oci-consul/modules/install-consul/install-consul --consul-version {{user `consul_version`}}",
+        "/tmp/terraform-oci-consul/modules/install-dnsmasq/install-dnsmasq"
+      ],
+      "inline_shebang": "/bin/bash -e",
+      "pause_before": "30s"
+    }
+  ]
+}

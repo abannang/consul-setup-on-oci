@@ -1,0 +1,30 @@
+### Required Keys and OCIDs
+### For more information, see https://docs.us-phoenix-1.oraclecloud.com/Content/API/Concepts/apisigningkey.htm
+
+### Tenancy OCID
+export TF_VAR_tenancy_ocid="<tenancy OCID>"
+
+### User OCID
+export TF_VAR_user_ocid="<user OCID>"
+
+### User RSA public key fingerprint
+export TF_VAR_fingerprint="<PEM key fingerprint>"
+
+### User RSA private key file path
+export TF_VAR_private_key_path="<path to the RSA private key that matches the above fingerprint>"
+
+### Region
+### For more information, see https://docs.us-phoenix-1.oraclecloud.com/Content/General/Concepts/regions.htm
+export TF_VAR_region="<region in which to operate, example: us-ashburn-1, us-phoenix-1>"
+
+### Compartment OCID
+export TF_VAR_compartment_ocid="<compartment OCID>"
+
+### SSH Public/Private keys used on the instance
+### For more information, see https://docs.us-phoenix-1.oraclecloud.com/Content/Compute/Tasks/managingkeypairs.htm
+export TF_VAR_ssh_public_key=$(cat <path to public key>)
+export TF_VAR_ssh_private_key=$(cat <path to private key>)
+
+### Image OCID of Consul Custom image created using the install-consul module
+export TF_VAR_image="<image OCID>"
+

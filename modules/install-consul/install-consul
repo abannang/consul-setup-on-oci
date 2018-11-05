@@ -1,0 +1,316 @@
+#!/usr/bin/env bash
+#
+# Description:
+#
+# This script installs Consul (https://www.consul.io/) and its dependencies on 
+# Oracle Cloud Infrastructure Compute Instances 
+# (https://cloud.oracle.com/en_US/infrastructure/compute).
+#
+# Note:
+# This script has been tested on the following Operating Systems:
+#   * Oracle Linux 7.4
+#
+
+# Set bash options
+set -e
+
+# Cleanup before exit
+trap 'cleanup "$@"' INT TERM EXIT
+
+# Variables specific to this file
+readonly _VERSION="0.1.0"
+readonly _DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly _FILE_NAME="$(basename "${BASH_SOURCE[0]}")"
+readonly _BASE="$(basename ${_FILE_NAME} .sh)"
+readonly _FILE="${_DIR}/${_FILE_NAME}"
+readonly _TMP="$(mktemp -d -t ${_BASE}_XXXX)"
+readonly _BIN="/usr/bin"
+
+# Default variables for Consul install
+readonly DEFAULT_CONSUL_VERSION="1.0.0"
+readonly DEFAULT_CONSUL_DIR="/opt/consul"
+readonly DEFAULT_CONSUL_USER="consul"
+
+# List of dependencies
+readonly DEP_PACKAGES=("unzip" "curl" "jq" "nc")
+
+# Supervisor variables
+readonly SUPERVISOR_DIR="/etc/supervisor"
+readonly SUPERVISOR_CONF_DIR="${SUPERVISOR_DIR}/conf.d"
+readonly SUPERVISOR_LOG_DIR="/var/log/supervisor"
+
+# Print Usage
+function print_usage {
+  echo -e "Usage: ${_FILE_NAME} [OPTIONS]"
+  echo
+  echo -e "  Installs Consul on Oracle Cloud Infrastructure instance."
+  echo
+  echo -e "Options:"
+  echo -e "  --consul-version [version]\tinstall Consul version (default is ${DEFAULT_CONSUL_VERSION})"
+  echo -e "  --consul-dir [path]\t\tset install dir for Consul (default is ${DEFAULT_CONSUL_DIR})"
+  echo -e "  --consul-user [user]\t\tset user for Consul (default is ${DEFAULT_CONSUL_USER})"
+  echo -e "  -v, --version\t\t\tshow ${_FILE_NAME} version and exit"
+  echo -e "  -h, --help\t\t\tdisplay this help and exit"
+}
+
+# Log Message
+function log {
+  local readonly level="$1"
+  local readonly message="$2"
+  local readonly timestamp=$(date +"%Y-%m-%d %H:%M:%S")
+  echo "${timestamp} [${level}] ${message}" \
+        | sudo tee -a /var/log/${_BASE}.log \
+        | sed --expression="s/${timestamp} //g" \
+        | logger -t ${_BASE} -s \
+        |& sed --expression="s/${_BASE}: //g" 1>&2
+}
+
+# Log INFO Message
+function log_info {
+  local readonly message="$1"
+  log "INFO" "$message"
+}
+
+# Log WARNING Message
+function log_warn {
+  local readonly message="$1"
+  log "WARNING" "$message"
+}
+
+# Log ERROR Message
+function log_error {
+  local readonly message="$1"
+  log "ERROR" "$message"
+}
+
+# Check if user exists
+function user_exists {
+  local readonly user="$1"
+  id "${user}" >/dev/null 2>&1
+}
+
+# Create user if not already exists
+function create_consul_user {
+  local readonly user="$1"
+
+  if $(user_exists "${user}"); then
+    log_warn "User '${user}' already exists. No action needed."
+  else
+    log_info "Creating user: ${user}"
+    sudo useradd "${user}"
+  fi
+}
+
+# Create Consul install dirs
+function create_consul_install_dirs {
+  local readonly dir="$1"
+  local readonly user="$2"
+
+  log_info "Creating Consul install dirs at ${dir}"
+  sudo mkdir -p "${dir}"
+  sudo mkdir -p "${dir}/bin"
+  sudo mkdir -p "${dir}/config"
+  sudo mkdir -p "${dir}/data"
+  sudo mkdir -p "${dir}/log"
+
+  log_info "Changing ownership of ${dir} to '${user}'"
+  sudo chown -R "${user}:${user}" "${dir}"
+}
+
+# Install Consul binaries
+function install_binaries {
+  local readonly version="$1"
+  local readonly dir="$2"
+  local readonly user="$3"
+
+  local readonly url="https://releases.hashicorp.com/consul/${version}/consul_${version}_linux_amd64.zip"
+  local readonly download_path="${_TMP}/consul_${version}_linux_amd64.zip"
+  local readonly consul_path="${dir}/bin/consul"
+  local readonly run_consul_path="${dir}/bin/run-consul"
+
+  log_info "Downloading Consul ${version} from $url to ${download_path}"
+  curl -o "${download_path}" "$url"
+  
+  log_info "Extracting ${download_path} to ${_TMP}"
+  unzip -d "${_TMP}" "${download_path}"
+
+  log_info "Moving Consul binary to ${consul_path}"
+  sudo mv "${_TMP}/consul" "${consul_path}"
+  
+  log_info "Changing ownership of ${consul_path} to '${user}'"
+  sudo chown "${user}:${user}" "${consul_path}"
+  sudo chmod a+x "${consul_path}"
+
+  local readonly consul_symlink="${_BIN}/consul"
+  if [[ -f "${consul_symlink}" ]]; then
+    log_warn "Symlink ${consul_symlink} already exists. No action needed."
+  else
+    log_info "Adding symlink to ${consul_path} at ${consul_symlink}"
+    sudo ln -s "${consul_path}" "${consul_symlink}"
+  fi
+
+  log_info "Moving Consul run script to ${run_consul_path}"
+  sudo mv "${_DIR}/../run-consul/run-consul" "${run_consul_path}"
+  
+  log_info "Changing ownership of ${run_consul_path} to '${user}'"
+  sudo chown "${user}:${user}" "${run_consul_path}"
+  sudo chmod a+x "${run_consul_path}"
+}
+
+# Install firewalld
+function install_firewalld_oracle_linux {
+  log_info "Installing firewalld..."
+  sudo yum install -y firewalld firewall-config
+
+  log_info "Starting firewalld..."
+  sudo systemctl enable firewalld.service
+  sudo systemctl start firewalld.service
+}
+
+# Install Oracle Cloud Infrastructure CLI
+function install_oci_cli {
+  local readonly url="https://raw.githubusercontent.com/oracle/oci-cli/master/scripts/install/install.sh"
+  local readonly download_path="$(mktemp -d -p ${_TMP} -t oci_cli_XXXX)/oci_cli_installer.sh"
+  
+  log_info "Downloading Oracle Cloud Infrastructure CLI Installer from $url to ${download_path}"
+  curl -o "${download_path}" "$url"
+  sudo chmod a+x "${download_path}"
+  
+  log_info "Installing Oracle Cloud Infrastructure CLI..."
+  sudo curl -L "${url}" | HOME='/usr' bash -s -- "--accept-all-defaults"
+  log_info "Oracle Cloud Infrastructure CLI installation Complete."
+}
+
+# Create config for Supervisor
+function create_supervisor_config {
+  log_info "Moving Supervisor config from ${_DIR}/supervisord.conf to ${SUPERVISOR_DIR}/supervisord.conf"
+  sudo mkdir -p "${SUPERVISOR_CONF_DIR}"
+  sudo mv "${_DIR}/supervisord.conf" "${SUPERVISOR_DIR}/supervisord.conf"
+}
+
+# Install Supervisor using apt-get
+function install_supervisord_debian {
+  log_info "Installing Supervisor..."
+  sudo apt-get install -y supervisor
+  sudo update-rc.d supervisor defaults
+
+  create_supervisor_config
+  log_info "Enabling Supervisor service..."
+  sudo systemctl enable supervisor
+}
+
+# Install Supervisor using pip
+function install_supervisord_oracle_linux {
+  log_info "Installing Supervisor..."
+  sudo pip install supervisor
+
+  log_info "Moving Supervisor init file from ${_DIR}/supervisor-initd-script.sh to /etc/init.d/supervisor"
+  sudo mv "${_DIR}/supervisor-initd-script.sh" "/etc/init.d/supervisor"
+  sudo chmod a+x "/etc/init.d/supervisor"
+  
+  log_info "Creating Supervisor log dir: ${SUPERVISOR_LOG_DIR}"
+  sudo mkdir -p "${SUPERVISOR_LOG_DIR}"
+
+  create_supervisor_config
+
+  log_info "Running Supervisor check config..."
+  sudo chkconfig --add supervisor
+  sudo chkconfig supervisor on
+  
+  log_info "Starting Supervisor service..."
+  sudo service supervisor start
+}
+
+# Install dependencies
+function install_dependencies {
+  log_info "Installing dependencies..."
+  if [[ -n "$(command -v apt-get)" ]]; then
+    sudo apt-get update -y
+    sudo apt-get install -y "${DEP_PACKAGES[@]}"
+    install_oci_cli
+    install_supervisord_debian
+  elif [[ -n "$(command -v yum)" ]]; then
+    sudo yum update -y
+    sudo yum install -y "${DEP_PACKAGES[@]}"
+    install_oci_cli
+    sudo easy_install pip
+    install_supervisord_oracle_linux
+    install_firewalld_oracle_linux
+  else
+    log_error "Unable to find apt-get or yum. Cannot install dependencies on this Operating System."
+    exit 1
+  fi
+}
+
+# Validate argument
+function assert_not_empty {
+  local readonly arg="$1"
+  local readonly value="$2"
+
+  if [[ -z "$value" ]]; then
+    log_error "Value for '$arg' cannot be empty."
+    >&2 print_usage
+    exit 1
+  fi
+}
+
+# Perform install
+function install {
+  local version="${DEFAULT_CONSUL_VERSION}"
+  local dir="${DEFAULT_CONSUL_DIR}"
+  local user="${DEFAULT_CONSUL_USER}"
+
+  while [[ $# > 0 ]]; do
+    local arg="$1"
+
+    case "$arg" in
+      --consul-version)
+        assert_not_empty "$arg" "$2"
+        version="$2"
+        shift
+        ;;
+      --consul-dir)
+        assert_not_empty "$arg" "$2"
+        dir="$2"
+        shift
+        ;;
+      --consul-user)
+        assert_not_empty "$arg" "$2"
+        user="$2"
+        shift
+        ;;
+      -v|--version)
+        echo "${_VERSION}"
+        exit
+        ;;
+      -h|--help)
+        print_usage
+        exit
+        ;;
+      *)
+        log_error "Unrecognized argument: '$arg'"
+        >&2 print_usage
+        exit 1
+        ;;
+    esac
+
+    shift
+  done
+
+  log_info "Starting Consul installation..."
+  install_dependencies
+  create_consul_user "${user}"
+  create_consul_install_dirs "${dir}" "${user}"
+  install_binaries "${version}" "${dir}" "${user}"
+
+  log_info "Consul installation Complete."
+  exit
+}
+
+# Silent cleanup
+function cleanup {
+  sudo rm -rf "${_TMP}"
+}
+
+# Start install
+install "$@"
